@@ -1,0 +1,62 @@
+--- a/src/channels/discord.ts
++++ b/src/channels/discord.ts
+@@ -1,4 +1,7 @@
++import fs from 'fs';
++
+ import {
++  AttachmentBuilder,
+   Client,
+   Events,
+   GatewayIntentBits,
+@@ -287,6 +290,37 @@ export class DiscordChannel implements Channel {
+     }
+   }
+
++  async sendFile(jid: string, filePath: string, caption?: string): Promise<void> {
++    if (!this.client) {
++      logger.warn('Discord client not initialized');
++      return;
++    }
++
++    try {
++      if (!fs.existsSync(filePath)) {
++        logger.error({ jid, filePath }, 'File not found for Discord upload');
++        return;
++      }
++
++      const channelId = jid.replace(/^dc:/, '');
++      const channel = await this.client.channels.fetch(channelId);
++
++      if (!channel || !('send' in channel)) {
++        logger.warn({ jid }, 'Discord channel not found or not text-based');
++        return;
++      }
++
++      const attachment = new AttachmentBuilder(filePath);
++      await (channel as TextChannel).send({
++        content: caption,
++        files: [attachment],
++      });
++      logger.info({ jid, filePath }, 'Discord file sent');
++    } catch (err) {
++      logger.error({ jid, filePath, err }, 'Failed to send Discord file');
++    }
++  }
++
+   isConnected(): boolean {
+     return this.client !== null && this.client.isReady();
+   }
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -627,6 +627,12 @@ async function main(): Promise<void> {
+       if (!channel) throw new Error(`No channel for JID: ${jid}`);
+       return channel.sendMessage(jid, text);
+     },
++    sendFile: (jid, filePath, caption) => {
++      const channel = findChannel(channels, jid);
++      if (!channel) throw new Error(`No channel for JID: ${jid}`);
++      if (!channel.sendFile) throw new Error(`Channel does not support sendFile: ${jid}`);
++      return channel.sendFile(jid, filePath, caption);
++    },
+     registeredGroups: () => registeredGroups,
+     registerGroup,

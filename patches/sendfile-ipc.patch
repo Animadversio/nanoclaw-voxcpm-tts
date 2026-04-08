@@ -1,0 +1,40 @@
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -91,6 +91,8 @@ export interface Channel {
+   setTyping?(jid: string, isTyping: boolean): Promise<void>;
+   // Optional: sync group/chat names from the platform.
+   syncGroups?(force: boolean): Promise<void>;
++  // Optional: send a file attachment (e.g. audio, image).
++  sendFile?(jid: string, filePath: string, caption?: string): Promise<void>;
+ }
+--- a/src/ipc.ts
++++ b/src/ipc.ts
+@@ -12,6 +12,7 @@ import { RegisteredGroup } from './types.js';
+
+ export interface IpcDeps {
+   sendMessage: (jid: string, text: string) => Promise<void>;
++  sendFile?: (jid: string, filePath: string, caption?: string) => Promise<void>;
+   registeredGroups: () => Record<string, RegisteredGroup>;
+   registerGroup: (jid: string, group: RegisteredGroup) => void;
+   syncGroups: (force: boolean) => Promise<void>;
+@@ -74,14 +75,18 @@ export function startIpcWatcher(deps: IpcDeps): void {
+             const filePath = path.join(messagesDir, file);
+             try {
+               const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+-              if (data.type === 'message' && data.chatJid && data.text) {
++              if (data.type === 'message' && data.chatJid && (data.text || data.file_path)) {
+                 // Authorization: verify this group can send to this chatJid
+                 const targetGroup = registeredGroups[data.chatJid];
+                 if (
+                   isMain ||
+                   (targetGroup && targetGroup.folder === sourceGroup)
+                 ) {
+-                  await deps.sendMessage(data.chatJid, data.text);
++                  if (data.file_path && deps.sendFile) {
++                    await deps.sendFile(data.chatJid, data.file_path, data.text);
++                  } else if (data.text) {
++                    await deps.sendMessage(data.chatJid, data.text);
++                  }
+                   logger.info(
+                     { chatJid: data.chatJid, sourceGroup },
+                     'IPC message sent',
