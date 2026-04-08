@@ -161,20 +161,31 @@ def normalize_for_tts(text: str) -> str:
     return text.strip()
 
 
-def split_into_segments(text: str, max_chars: int = 1800) -> list[str]:
+def split_into_segments(text: str, max_chars: int = 400) -> list[str]:
     """
     Split text into segments of at most max_chars.
-    Tries to break at sentence boundaries.
+    Handles both Chinese (。！？) and English (.!?) sentence boundaries.
+    VoxCPM2 KV cache is 8192 positions; ~1 char ≈ 1 position, so keep well under.
     """
     if len(text) <= max_chars:
         return [text]
 
+    # Split on Chinese and English sentence-ending punctuation
+    sentences = re.split(r'(?<=[。！？.!?])\s*', text)
     segments = []
-    # Split on sentence-ending punctuation followed by whitespace
-    sentences = re.split(r'(?<=[.!?])\s+', text)
     buf = ''
     for sent in sentences:
-        if len(buf) + len(sent) + 1 > max_chars:
+        sent = sent.strip()
+        if not sent:
+            continue
+        # If a single sentence exceeds max_chars, hard-split it
+        if len(sent) > max_chars:
+            if buf:
+                segments.append(buf.strip())
+                buf = ''
+            for i in range(0, len(sent), max_chars):
+                segments.append(sent[i:i + max_chars])
+        elif len(buf) + len(sent) + 1 > max_chars:
             if buf:
                 segments.append(buf.strip())
             buf = sent
@@ -182,7 +193,7 @@ def split_into_segments(text: str, max_chars: int = 1800) -> list[str]:
             buf = (buf + ' ' + sent).strip() if buf else sent
     if buf:
         segments.append(buf.strip())
-    return segments
+    return [s for s in segments if s.strip()]
 
 
 # ── Audio generation ───────────────────────────────────────────────────────────
@@ -198,32 +209,57 @@ def load_model():
     return model
 
 
-def generate_segment(model, text: str, voice_style: str, steps: int) -> tuple:
-    """Generate a single audio segment. Returns (wav_array, sample_rate)."""
-    prompt = f'({voice_style}) {text}' if voice_style else text
-    wav = model.generate(text=prompt, cfg_value=2.0, inference_timesteps=steps)
-    return wav, model.tts_model.sample_rate
-
-
 def generate_chapter_audio(model, text: str, voice_style: str, steps: int,
                             out_wav: Path) -> None:
-    """Generate audio for a full chapter (splits long text, concatenates)."""
+    """
+    Generate audio for a full chapter with consistent voice across segments.
+
+    Strategy:
+    - Segment 1: generate with voice style prompt → save as anchor WAV
+    - Segments 2+: use model.generate(prompt_text=seg1, prompt_wav_path=anchor)
+                   to clone the voice from segment 1 exactly
+    """
     import numpy as np
     import soundfile as sf
+    import tempfile
 
-    segments = split_into_segments(text, max_chars=1800)
+    segments = split_into_segments(text, max_chars=400)
     print(f'  {len(segments)} segment(s)', flush=True)
 
     parts = []
-    sample_rate = None
+    sample_rate = model.tts_model.sample_rate
+    anchor_wav_path = None
+    anchor_text = None
+
     for j, seg in enumerate(segments):
         print(f'  segment {j+1}/{len(segments)} ({len(seg)} chars)...', flush=True)
-        wav, sr = generate_segment(model, seg, voice_style, steps)
+
+        if j == 0:
+            # First segment: generate with voice style prompt
+            prompt = f'({voice_style}) {seg}' if voice_style else seg
+            wav = model.generate(text=prompt, cfg_value=2.0, inference_timesteps=steps)
+            # Save as anchor for voice cloning in subsequent segments
+            anchor_wav_path = out_wav.parent / f'_anchor_{out_wav.stem}.wav'
+            sf.write(str(anchor_wav_path), wav, sample_rate)
+            anchor_text = seg
+        else:
+            # Subsequent segments: clone voice from anchor
+            wav = model.generate(
+                text=seg,
+                prompt_text=anchor_text,
+                prompt_wav_path=str(anchor_wav_path),
+                cfg_value=2.0,
+                inference_timesteps=steps,
+            )
+
         parts.append(wav)
-        sample_rate = sr
 
     combined = np.concatenate(parts) if len(parts) > 1 else parts[0]
     sf.write(str(out_wav), combined, sample_rate)
+
+    # Clean up anchor
+    if anchor_wav_path and anchor_wav_path.exists():
+        anchor_wav_path.unlink()
 
 
 def wav_to_mp3(wav_path: Path, mp3_path: Path, bitrate: str = '64k') -> None:
