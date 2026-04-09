@@ -60,39 +60,157 @@ def extract_chapters_epub(filepath: Path) -> list[dict]:
     from html.parser import HTMLParser
 
     class _Extractor(HTMLParser):
+        """Extract text and chapter title from an EPUB HTML document.
+
+        Title priority:
+          1. <h1/h2/h3> with class containing 'chapter' or 'title'
+          2. Any <h1/h2/h3>
+          3. <p> with class 'calibre9' (used in this EPUB for English sub-titles)
+          4. First non-trivial text line as fallback
+        """
         def __init__(self):
             super().__init__()
             self.chunks, self._buf, self._skip = [], [], False
+            self._cur_tag = ''
+            self._cur_classes = set()
+            self.h_titles = []   # headings: (priority, text)
+            self._in_title_tag = False
+
         def handle_starttag(self, tag, attrs):
+            adict = dict(attrs)
+            classes = set(adict.get('class', '').split())
+            self._cur_tag = tag
+            self._cur_classes = classes
             if tag in ('script', 'style'):
                 self._skip = True
-            elif tag in ('p', 'br', 'h1', 'h2', 'h3', 'h4', 'li'):
-                if self._buf:
-                    self.chunks.append(''.join(self._buf).strip())
-                    self._buf = []
+                return
+            if self._buf:
+                self.chunks.append(''.join(self._buf).strip())
+                self._buf = []
+            # Detect title tags
+            if tag in ('h1', 'h2', 'h3'):
+                priority = 1 if classes & {'chapter', 'title', 'chapter-title'} else 2
+                self._in_title_tag = priority
+            elif tag == 'p' and 'calibre9' in classes:
+                self._in_title_tag = 3  # English sub-title style in this EPUB
+            else:
+                self._in_title_tag = False
+
         def handle_endtag(self, tag):
             if tag in ('script', 'style'):
                 self._skip = False
+                return
+            text = ''.join(self._buf).strip()
+            self._buf = []
+            if text:
+                self.chunks.append(text)
+            if self._in_title_tag and text:
+                self.h_titles.append((self._in_title_tag, text))
+            self._in_title_tag = False
+
         def handle_data(self, data):
             if not self._skip:
                 self._buf.append(data)
+
         def get_text(self):
             if self._buf:
                 self.chunks.append(''.join(self._buf).strip())
             return ' '.join(c for c in self.chunks if c)
 
+        def best_title(self):
+            if not self.h_titles:
+                return ''
+            # Sort by priority (lower = better), group by priority
+            by_pri = {}
+            for pri, t in self.h_titles:
+                by_pri.setdefault(pri, []).append(t)
+            best_pri = min(by_pri)
+            parts = by_pri[best_pri]
+            # If there's also a calibre9 English subtitle, append it
+            if best_pri < 3 and 3 in by_pri:
+                parts = parts + by_pri[3]
+            # Join unique parts, strip chapter numbers (e.g. "01   ")
+            seen, out = set(), []
+            for p in parts:
+                p = re.sub(r'^\d+\s+', '', p).strip()
+                if p and p not in seen:
+                    seen.add(p)
+                    out.append(p)
+            return ' / '.join(out)
+
     book = epub.read_epub(str(filepath))
-    chapters = []
+    _CJK = re.compile(r'[\u4e00-\u9fff]')
+
+    def _has_cjk(s):
+        return bool(_CJK.search(s))
+
+    raw = []
     for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
         parser = _Extractor()
         parser.feed(item.get_content().decode('utf-8', errors='ignore'))
         text = parser.get_text().strip()
-        if len(text) < 150:
-            continue  # skip nav/toc/cover pages
-        # Try to pull a title from epub metadata or filename
-        name = item.get_name() or ''
-        title = re.sub(r'[_\-/]', ' ', Path(name).stem).strip().title()
-        chapters.append({'title': title or 'Chapter', 'text': text})
+        title = parser.best_title()
+
+        if len(text) < 80:
+            # Skip truly empty items (nav/toc/cover) unless they have a meaningful heading
+            if not title:
+                continue
+            # Short item with a heading = chapter title file (e.g. _split_000 CJK headings)
+            raw.append({'title': title, 'text': '', 'heading_only': True})
+            continue
+
+        if not title:
+            title = ' '.join(text.split()[:6])[:50]
+        raw.append({'title': title or 'Chapter', 'text': text, 'heading_only': False})
+
+    # Merge consecutive items into proper chapters.
+    # heading_only items (CJK chapter heading files) flush the buffer and set the CJK title.
+    # The next content item provides the English subtitle (calibre9) and body text.
+    chapters = []
+    buf_title, buf_en, buf_text = '', '', ''
+
+    for item in raw:
+        t = item['title']
+        heading_only = item.get('heading_only', False)
+
+        if heading_only:
+            # Flush previous chapter
+            if buf_text:
+                full_title = buf_title + (f' / {buf_en}' if buf_en else '')
+                chapters.append({'title': full_title, 'text': buf_text})
+            # Start new chapter with CJK title; content comes from next item(s)
+            buf_title = re.sub(r'^\d+\s+', '', t).strip()
+            buf_en = ''
+            buf_text = ''
+            continue
+
+        cjk_title = _has_cjk(t)
+
+        if not buf_text:
+            # Buffer empty — start fresh chapter
+            if not buf_title:
+                # No title set yet (no preceding heading_only)
+                buf_title = (re.sub(r'^\d+\s+', '', t) if cjk_title else t).strip()
+            elif not cjk_title and t:
+                # CJK title already set by heading_only; this item has the English subtitle
+                buf_en = t
+            buf_text = item['text']
+        elif cjk_title:
+            # Non-empty buffer + new CJK-titled content = new chapter
+            full_title = buf_title + (f' / {buf_en}' if buf_en else '')
+            chapters.append({'title': full_title, 'text': buf_text})
+            buf_title = re.sub(r'^\d+\s+', '', t).strip()
+            buf_en = ''
+            buf_text = item['text']
+        else:
+            # Continuation: English-titled or untitled fragment
+            if not buf_en and t and t != buf_title:
+                buf_en = t
+            buf_text += '\n\n' + item['text']
+
+    if buf_text:
+        full_title = buf_title + (f' / {buf_en}' if buf_en else '')
+        chapters.append({'title': full_title, 'text': buf_text})
     return chapters
 
 
